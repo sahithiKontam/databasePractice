@@ -1,77 +1,123 @@
 const axios = require("axios");
 const pool = require("./db");
 
-// World Bank API
 const BASE_URL =
   "https://api.worldbank.org/v2/country/all/indicator/SP.POP.TOTL";
 
 const PER_PAGE = 100;
-const MAX_PAGES = 173; 
-// sleep helper (rate-limit safe)
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const MAX_PAGES = 173;
+const CONCURRENT_REQUESTS = 7;
+
+let totalFetchTime = 0n;
+let totalInsertTime = 0n;
+
+console.time("Total Execution Time");
+
+async function fetchPage(page) {
+  const start = process.hrtime.bigint();
+
+  const response = await axios.get(BASE_URL, {
+    params: {
+      format: "json",
+      per_page: PER_PAGE,
+      page,
+    },
+    timeout: 15000,
+  });
+
+  const end = process.hrtime.bigint();
+  totalFetchTime += end - start;
+
+  return response.data[1] || [];
 }
-async function fetchAndSave() {
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    console.log(`Fetching page ${page}...`);
+//bulk insertion
+async function bulkInsert(records) {
+  const values = [];
+  const placeholders = [];
+  let rowIndex = 0;
 
-    try {
-      const response = await axios.get(BASE_URL, {
-        params: {
-          format: "json",
-          per_page: PER_PAGE,
-          page: page,
-        },
-        timeout: 10000,
-      });
+  for (const r of records) {
+    if (!r.countryiso3code || !r.date) continue;
 
-      // World Bank response format: [metadata, data[]]
-      const records = response.data[1];
+    const base = rowIndex * 4;
+    placeholders.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`
+    );
 
-      if (!records || records.length === 0) {
-        console.log("No more records found");
-        break;
-      }
+    values.push(
+      r.countryiso3code,
+      r.country?.value || null,
+      parseInt(r.date),
+      r.value
+    );
 
-      // insert page records
-      for (const record of records) {
-        const countryCode = record.countryiso3code;
-        const countryName = record.country?.value;
-        const year = parseInt(record.date);
-        const population = record.value;
-
-        if (!countryCode || !year) continue;
-
-        await pool.query(
-          `
-          INSERT INTO world_bank_population
-          (country_code, country_name, year, population)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (country_code, year)
-          DO UPDATE SET population = EXCLUDED.population
-          `,
-          [countryCode, countryName, year, population]
-        );
-      }
-
-      console.log(`Page ${page} saved successfully`);
-
-      // small delay to avoid API issues
-      await sleep(500);
-
-    } catch (error) {
-      console.error(`Error on page ${page}. Skipping this page.`);
-      await sleep(2000); // wait before next page
-      continue;
-    }
+    rowIndex++;
   }
 
+  if (values.length === 0) return;
+
+  const start = process.hrtime.bigint();
+
+  await pool.query(
+    `
+    INSERT INTO world_bank_population
+    (country_code, country_name, year, population)
+    VALUES ${placeholders.join(",")}
+    ON CONFLICT (country_code, year)
+    DO UPDATE SET population = EXCLUDED.population
+    `,
+    values
+  );
+
+  const end = process.hrtime.bigint();
+  totalInsertTime += end - start;
+}
+
+async function fetchAndSave() {
+  for (let start = 1; start <= MAX_PAGES; start += CONCURRENT_REQUESTS) {
+    const pages = [];
+
+    for (let p = start; p < start + CONCURRENT_REQUESTS && p <= MAX_PAGES; p++) {
+      pages.push(p);
+    }
+
+    console.log(`Fetching pages ${pages.join(", ")}`);
+
+    const pageResults = await Promise.all(
+      pages.map((p) =>
+        fetchPage(p).catch(() => {
+          console.error(`Page ${p} failed`);
+          return [];
+        })
+      )
+    );
+
+    const allRecords = pageResults.flat();
+    await bulkInsert(allRecords);
+
+    console.log(`Saved pages ${pages.join(", ")}`);
+  }
+
+  // timing logs
+  console.log(
+    `Total Fetch Time: ${(Number(totalFetchTime) / 1e9).toFixed(2)} seconds`
+  );
+  console.log(
+    `Total Insert Time: ${(Number(totalInsertTime) / 1e9).toFixed(2)} seconds`
+  );
+
+  console.timeEnd("Total Execution Time");
   console.log("DATA FETCH & SAVE COMPLETED");
+
   process.exit(0);
 }
 
-// run job
+// ---------- Run ----------
 fetchAndSave().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
 });
+
+//separte exe time for insertionnor fetching
+//optimzation
+//postgres connections any other connncetions
